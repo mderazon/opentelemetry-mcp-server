@@ -668,7 +668,7 @@ async def list_environments() -> str:
             environments=sorted(_backends.keys()),
             default_environment=_default_environment,
         )
-        return json.dumps(response.model_dump(mode="json"))
+        return json.dumps(response.model_dump(mode="json"), indent=2)
     except Exception as e:
         return _handle_tool_error("list_environments", e)
 
