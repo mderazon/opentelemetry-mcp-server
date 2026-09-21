@@ -7,6 +7,7 @@ from typing import Any
 
 import click
 from fastmcp import FastMCP
+from pydantic import BaseModel
 
 from opentelemetry_mcp.backends.base import BaseBackend
 from opentelemetry_mcp.backends.jaeger import JaegerBackend
@@ -50,9 +51,17 @@ def _handle_tool_error(tool_name: str, error: Exception) -> str:
     return json.dumps({"error": f"Tool execution failed: {str(error)}"})
 
 
+class EnvironmentsResponse(BaseModel):
+    """Response model for the list_environments tool."""
+
+    environments: list[str]
+    default_environment: str
+
+
 # Global backend instances per environment
 _backends: dict[str, BaseBackend] = {}
 _default_environment: str = "default"
+_health_checked: set[str] = set()
 _config: ServerConfig | None = None
 
 # Initialize FastMCP server
@@ -139,22 +148,26 @@ async def _get_backend(environment: str | None = None) -> BaseBackend:
         _backends = _create_backends(_config)
         _default_environment = _config.backend.default_environment
 
-        # Perform health checks on first initialization
-        for name, backend in _backends.items():
-            try:
-                health = await backend.health_check()
-                logger.info(f"Backend '{name}' health check: {health}")
-                if health.status != "healthy":
-                    logger.warning(f"Backend '{name}' is not healthy, but continuing...")
-            except Exception as e:
-                logger.error(f"Backend '{name}' health check failed: {e}")
-                logger.warning("Continuing anyway, requests may fail...")
-
     env = environment or _default_environment
     if env not in _backends:
         raise ValueError(f"Unknown environment '{env}'. Available: {sorted(_backends)}")
 
-    return _backends[env]
+    backend = _backends[env]
+
+    # Health-check the selected environment once, on first use, so an
+    # unreachable backend in another environment does not delay this request.
+    if env not in _health_checked:
+        _health_checked.add(env)
+        try:
+            health = await backend.health_check()
+            logger.info(f"Backend '{env}' health check: {health}")
+            if health.status != "healthy":
+                logger.warning(f"Backend '{env}' is not healthy, but continuing...")
+        except Exception as e:
+            logger.error(f"Backend '{env}' health check failed: {e}")
+            logger.warning("Continuing anyway, requests may fail...")
+
+    return backend
 
 
 @mcp.tool()
@@ -651,12 +664,11 @@ async def list_environments() -> str:
     try:
         # Ensure backends are initialised
         await _get_backend()
-        return json.dumps(
-            {
-                "environments": sorted(_backends.keys()),
-                "default_environment": _default_environment,
-            }
+        response = EnvironmentsResponse(
+            environments=sorted(_backends.keys()),
+            default_environment=_default_environment,
         )
+        return json.dumps(response.model_dump(mode="json"))
     except Exception as e:
         return _handle_tool_error("list_environments", e)
 

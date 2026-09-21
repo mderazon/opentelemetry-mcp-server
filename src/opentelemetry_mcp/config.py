@@ -88,6 +88,9 @@ class BackendConfig(BaseModel):
                 raise ValueError(
                     f"Invalid URL '{url}' for environment '{name}' in BACKEND_URLS: {e}"
                 ) from e
+
+        if not backend_urls:
+            raise ValueError("BACKEND_URLS must contain at least one environment mapping")
         return backend_urls
 
     @classmethod
@@ -113,7 +116,8 @@ class BackendConfig(BaseModel):
             timeout = 30.0
 
         # Multi-environment routing configuration
-        default_environment = os.getenv("DEFAULT_ENVIRONMENT", "default").strip()
+        default_environment_raw = os.getenv("DEFAULT_ENVIRONMENT")
+        default_environment = (default_environment_raw or "default").strip()
         if not default_environment:
             logger.warning("DEFAULT_ENVIRONMENT is empty. Using default: 'default'")
             default_environment = "default"
@@ -130,10 +134,25 @@ class BackendConfig(BaseModel):
                 default_environment: TypeAdapter(HttpUrl).validate_python("http://localhost:16686")
             }
 
-        # The legacy `url` field mirrors the default environment's URL (or the
-        # first configured one) so consumers not yet aware of backend_urls keep
-        # working unchanged.
-        url = backend_urls.get(default_environment) or next(iter(backend_urls.values()))
+        # The effective default environment must always resolve to a configured
+        # backend; otherwise every default-routed tool call would fail at runtime.
+        if default_environment not in backend_urls:
+            if default_environment_raw:
+                raise ValueError(
+                    f"DEFAULT_ENVIRONMENT '{default_environment}' is not one of the configured "
+                    f"environments in BACKEND_URLS: {sorted(backend_urls)}"
+                )
+            # No explicit DEFAULT_ENVIRONMENT: fall back to the first configured
+            # environment so a bare BACKEND_URLS remains usable.
+            default_environment = next(iter(backend_urls))
+            logger.warning(
+                f"DEFAULT_ENVIRONMENT is not set and 'default' is not one of the configured "
+                f"environments: {sorted(backend_urls)}. Using '{default_environment}'."
+            )
+
+        # The legacy `url` field mirrors the default environment's URL so
+        # consumers not yet aware of backend_urls keep working unchanged.
+        url = backend_urls[default_environment]
 
         return cls(
             type=backend_type,  # type: ignore
@@ -196,9 +215,6 @@ class ServerConfig(BaseModel):
                 )
             self.backend.type = backend_type  # type: ignore
 
-        if backend_url:
-            self.backend.url = TypeAdapter(HttpUrl).validate_python(backend_url)
-
         if api_key:
             self.backend.api_key = api_key
 
@@ -207,8 +223,27 @@ class ServerConfig(BaseModel):
                 env.strip() for env in environments.split(",") if env.strip()
             ]
 
-        if backend_urls:
-            self.backend.backend_urls = BackendConfig.parse_backend_urls(backend_urls)
-
         if default_environment:
             self.backend.default_environment = default_environment
+
+        if backend_url:
+            validated_url = TypeAdapter(HttpUrl).validate_python(backend_url)
+            self.backend.url = validated_url
+            # Keep backend_urls in sync so the legacy --url flag remains
+            # effective when BACKEND_URLS / --backend-urls are configured.
+            self.backend.backend_urls[self.backend.default_environment] = validated_url
+
+        if backend_urls:
+            # Applied last so that --backend-urls stays authoritative over --url.
+            self.backend.backend_urls = BackendConfig.parse_backend_urls(backend_urls)
+
+        # Validate the final state: the effective default environment must
+        # resolve to a configured backend after all overrides are applied.
+        if (
+            self.backend.backend_urls
+            and self.backend.default_environment not in self.backend.backend_urls
+        ):
+            raise ValueError(
+                f"Default environment '{self.backend.default_environment}' is not one of "
+                f"the configured environments: {sorted(self.backend.backend_urls)}"
+            )

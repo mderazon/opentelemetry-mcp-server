@@ -32,6 +32,7 @@ def reset_server_state(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reset server module globals between tests."""
     monkeypatch.setattr(server, "_backends", {})
     monkeypatch.setattr(server, "_default_environment", "default")
+    monkeypatch.setattr(server, "_health_checked", set())
     monkeypatch.setattr(server, "_config", None)
 
 
@@ -86,6 +87,12 @@ def test_parse_backend_urls_invalid_raises() -> None:
         BackendConfig.parse_backend_urls("not-a-url-format!!")
 
 
+def test_parse_backend_urls_empty_raises() -> None:
+    """An empty mapping is rejected with a clear error."""
+    with pytest.raises(ValueError, match="at least one"):
+        BackendConfig.parse_backend_urls("{}")
+
+
 # --- BackendConfig.from_env ---
 
 
@@ -127,6 +134,65 @@ def test_from_env_default_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     config = BackendConfig.from_env()
 
     assert config.default_environment == "prod"
+
+
+def test_from_env_default_not_in_backend_urls_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DEFAULT_ENVIRONMENT must name one of the configured environments."""
+    monkeypatch.setenv(
+        "BACKEND_URLS",
+        '{"prod": "http://prod.example.com", "qa": "http://qa.example.com"}',
+    )
+    monkeypatch.setenv("DEFAULT_ENVIRONMENT", "staging")
+    monkeypatch.delenv("BACKEND_URL", raising=False)
+
+    with pytest.raises(ValueError, match="staging"):
+        BackendConfig.from_env()
+
+
+def test_from_env_bare_backend_urls_defaults_to_first_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bare BACKEND_URLS without DEFAULT_ENVIRONMENT defaults to the first env."""
+    monkeypatch.setenv(
+        "BACKEND_URLS",
+        '{"prod": "http://prod.example.com", "qa": "http://qa.example.com"}',
+    )
+    monkeypatch.delenv("BACKEND_URL", raising=False)
+    monkeypatch.delenv("DEFAULT_ENVIRONMENT", raising=False)
+
+    config = BackendConfig.from_env()
+
+    assert config.default_environment == "prod"
+
+
+# --- ServerConfig.apply_cli_overrides ---
+
+
+def test_apply_cli_overrides_backend_url_updates_backend_urls() -> None:
+    """--url replaces the default environment's URL in backend_urls."""
+    config = _make_server_config()
+
+    config.apply_cli_overrides(backend_url="http://new-default.example.com")
+
+    assert config.backend.backend_urls["prod"] == HttpUrl("http://new-default.example.com")
+    assert config.backend.backend_urls["qa"] == HttpUrl("http://qa.example.com")
+
+
+def test_apply_cli_overrides_backend_urls_takes_precedence_over_backend_url() -> None:
+    """--backend-urls is applied last and wins over --url."""
+    config = _make_server_config()
+
+    config.apply_cli_overrides(
+        backend_url="http://ignored.example.com",
+        backend_urls="prod=http://cli-prod.example.com,qa=http://cli-qa.example.com",
+    )
+
+    assert config.backend.backend_urls == {
+        "prod": HttpUrl("http://cli-prod.example.com"),
+        "qa": HttpUrl("http://cli-qa.example.com"),
+    }
 
 
 # --- server._get_backend routing ---
@@ -180,6 +246,21 @@ async def test_get_backend_unknown_env_raises(
     assert "staging" in message
     assert "prod" in message
     assert "qa" in message
+
+
+async def test_get_backend_health_checks_only_selected(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_server_state: None,
+    mock_backends: dict[str, BaseBackend],
+) -> None:
+    """Only the selected environment is health-checked on first use."""
+    _configure_mocks(monkeypatch, mock_backends)
+
+    backend = await server._get_backend("qa")
+
+    assert backend is mock_backends["qa"]
+    mock_backends["qa"].health_check.assert_awaited_once()
+    mock_backends["prod"].health_check.assert_not_called()
 
 
 # --- list_environments tool ---
